@@ -3,115 +3,113 @@ import chromadb
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
-from dotenv import load_dotenv
 from tqdm import tqdm
+from dotenv import load_dotenv
 
-# Load environment variables
+# Load config from .env
 load_dotenv()
 
-# Configuration
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5-coder:7b")
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
-LIMIT = int(os.getenv("INGEST_LIMIT", "500"))
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+MAX_SAMPLES = int(os.getenv("MAX_SAMPLES", 500))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "code_search")
 
-print(f"Initializing OpenAI client for Ollama at {OLLAMA_BASE_URL}...")
+# Initialize models and clients
+# We use the OpenAI client pointed to Ollama's local wrapper for drop-in compatibility
 client = OpenAI(
     base_url=OLLAMA_BASE_URL,
-    api_key="ollama" # required by the OpenAI package, but unused by Ollama
+    api_key="ollama" # Required for the client but ignored by Ollama
 )
 
-print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-print(f"Initializing ChromaDB at {CHROMA_DB_PATH}...")
+embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
-
-def generate_description(code: str) -> str:
-    """Uses Ollama to generate a one-sentence natural language description of the code."""
-    prompt = f"""You are a senior software engineer. Please provide a brief, one-sentence natural language description explaining what the following Python snippet does. Return ONLY the description, nothing else.
-
-Code:
-```python
-{code}
-```
-
-Description:"""
-    
+def generate_description(code_snippet: str) -> str:
+    """Generate a concise natural language description of the code using local LLM via Ollama."""
     try:
         response = client.chat.completions.create(
-            model=LLM_MODEL,
+            model=OLLAMA_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that describes code snippets concisely."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system", 
+                    "content": "You are an expert programmer. Give a concise, 1-2 sentence description of what the following Python code does. Focus on the core functionality."
+                },
+                {"role": "user", "content": code_snippet}
             ],
-            temperature=0.1,
-            max_tokens=100
+            max_tokens=100,
+            temperature=0.3
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"\nError generating description for snippet: {e}")
+        print(f"Error generating description: {e}")
         return ""
 
-
-def process_snippet(i: int, sample: dict):
-    # Create a unique, deterministic ID
-    doc_id = f"snippet_{i}"
-    
-    # Check if already processed to avoid duplicate work on restart
-    existing = collection.get(ids=[doc_id])
-    if existing and existing['ids']:
-        return True # already processed
-        
-    code = sample.get('original_string', '')
-    if not code:
-        return False
-        
-    description = generate_description(code)
-    if not description:
-        return False
-        
-    # Generate the vector embedding using sentence-transformers
-    vector = embedding_model.encode(description).tolist()
-    
-    metadata = {
-        "original_code": code,
-        "language": "python",
-        "llm_description": description,
-        "repository": sample.get("repository_name", ""),
-        "func_name": sample.get("func_name", "")
-    }
-    
-    # Store directly in ChromaDB
-    collection.add(
-        ids=[doc_id],
-        embeddings=[vector],
-        metadatas=[metadata],
-        documents=[description]
-    )
-    return True
-
-
 def main():
-    print("Loading CodeSearchNet dataset (Python subset)...")
-    dataset = load_dataset("code_search_net", "python", trust_remote_code=True)
-    train_data = dataset["train"]
+    print("Loading CodeSearchNet dataset...")
+    # Load the Python split of CodeSearchNet
+    dataset = load_dataset("code_search_net", "python", split="train")
     
-    num_samples = min(LIMIT, len(train_data))
-    print(f"Processing first {num_samples} samples from the dataset...")
+    # Take the first MAX_SAMPLES
+    subset = dataset.select(range(min(MAX_SAMPLES, len(dataset))))
     
-    success_count = 0
-    for i in tqdm(range(num_samples), desc="Ingesting snippets"):
-        success = process_snippet(i, train_data[i])
-        if success:
-            success_count += 1
+    print(f"Processing {len(subset)} snippets...")
+    
+    for i in tqdm(range(0, len(subset), BATCH_SIZE), desc="Processing Batches"):
+        batch = subset[i:i+BATCH_SIZE]
+        
+        descriptions = []
+        valid_indices = []
+        codes = []
+        
+        # Dataset field containing the code
+        code_keys = ["func_code_string", "whole_func_string", "code"]
+        code_key = next((k for k in code_keys if k in batch), None)
+        if not code_key:
+            print(f"Dataset keys: {batch.keys()}")
+            print("Could not find code field in dataset!")
+            break
             
-    print(f"\nDone! {success_count} valid snippets have been ingested into ChromaDB.")
-
+        code_list = batch[code_key]
+        
+        # Generate descriptions sequentially for this batch 
+        for j, code in enumerate(code_list):
+            desc = generate_description(code)
+            if desc:
+                descriptions.append(desc)
+                valid_indices.append(j)
+                codes.append(code)
+        
+        if not descriptions:
+            continue
+            
+        # Embed descriptions using SentenceTransformers
+        embeddings = embedding_model.encode(descriptions).tolist()
+        
+        # Prepare for ChromaDB
+        ids = [f"doc_{i+j}" for j in valid_indices]
+        metadatas = [{"code": codes[j], "language": "python", "description": descriptions[j]} for j in range(len(descriptions))]
+        documents = descriptions  # the actual document content is the description
+        
+        # Upsert to ChromaDB
+        collection.upsert(
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids
+        )
+        
+    print(f"\\nIngestion complete. Vector DB saved to {CHROMA_DB_PATH}")
 
 if __name__ == "__main__":
-    main()
+    # Check if Ollama seems reachable (basic check)
+    import requests
+    try:
+        requests.get("http://localhost:11434")
+        main()
+    except requests.exceptions.ConnectionError:
+        print("Wait! Ollama doesn't seem to be running on localhost:11434.")
+        print("Please start Ollama and try running ingest.py again.")

@@ -1,97 +1,76 @@
 import os
-import argparse
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from dotenv import load_dotenv
 
 load_dotenv()
 
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
-CROSS_ENCODER_MODEL_NAME = os.getenv("CROSS_ENCODER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "code_search")
 
-print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+print("Initializing search models...")
+# Initialize embedding and re-ranking models
+embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
 
-print(f"Loading cross-encoder model '{CROSS_ENCODER_MODEL_NAME}'...")
-cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL_NAME)
-
-print(f"Connecting to ChromaDB at {CHROMA_DB_PATH}...")
+# Connect to ChromaDB
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-try:
-    collection = chroma_client.get_collection(name=COLLECTION_NAME)
-except ValueError:
-    print(f"Collection '{COLLECTION_NAME}' not found. Please run ingest.py first.")
-    exit(1)
+collection = chroma_client.get_collection(name=COLLECTION_NAME)
 
-def search_code(query: str, top_k: int = 5, retrieve_k: int = 20):
-    """Search for code snippets matching the natural language query."""
+def search_code(query: str, top_k_retrieve: int = 20, top_k_return: int = 5):
+    """
+    1. Embed query using sentence-transformers
+    2. Retrieve top_k_retrieve from ChromaDB
+    3. Re-rank using CrossEncoder
+    4. Return top_k_return results
+    """
+    # 1. Embed query
+    query_embedding = embedding_model.encode([query]).tolist()[0]
     
-    # 1. Embed the user query
-    query_vector = embedding_model.encode(query).tolist()
-    
-    # 2. Retrieve top `retrieve_k` candidates from ChromaDB
+    # 2. Retrieve candidates
     results = collection.query(
-        query_embeddings=[query_vector],
-        n_results=retrieve_k
+        query_embeddings=[query_embedding],
+        n_results=top_k_retrieve,
+        include=["metadatas", "documents"]
     )
     
-    if not results['ids'] or not results['ids'][0]:
+    if not results['documents'] or not results['documents'][0]:
         return []
         
-    documents = results['documents'][0]
-    metadatas = results['metadatas'][0]
-    ids = results['ids'][0]
+    retrieved_docs = results['documents'][0]
+    retrieved_metadatas = results['metadatas'][0]
     
-    # 3. Re-rank using cross-encoder
-    # CrossEncoder expects pairs of (query, document)
-    cross_inp = [[query, doc] for doc in documents]
+    # 3. Re-rank utilizing cross-encoder
+    # Form pairs of (query, document)
+    cross_inp = [[query, doc] for doc in retrieved_docs]
     cross_scores = cross_encoder.predict(cross_inp)
     
-    # Sort results by score in descending order
-    # Create a list of tuples: (score, id, document, metadata)
-    scored_results = list(zip(cross_scores, ids, documents, metadatas))
-    scored_results.sort(key=lambda x: x[0], reverse=True)
-    
-    # 4. Return top `top_k` results
-    top_results = []
-    for score, doc_id, doc, meta in scored_results[:top_k]:
-        top_results.append({
-            "id": doc_id,
-            "score": float(score),
-            "description": doc,
-            "code": meta.get("original_code", ""),
-            "language": meta.get("language", ""),
-            "repository": meta.get("repository", ""),
-            "func_name": meta.get("func_name", "")
+    # Rank documents by cross-encoder score
+    scored_results = []
+    for i in range(len(cross_scores)):
+        scored_results.append({
+            "score": float(cross_scores[i]),
+            "description": retrieved_metadatas[i]["description"],
+            "code": retrieved_metadatas[i]["code"],
+            "language": retrieved_metadatas[i]["language"]
         })
         
-    return top_results
-
-def main():
-    parser = argparse.ArgumentParser(description="Semantic Code Search Engine")
-    parser.add_argument("query", type=str, help="Natural language search query")
-    parser.add_argument("--top-k", type=int, default=5, help="Number of results to return")
-    args = parser.parse_args()
+    # Sort descending by re-ranker score
+    scored_results = sorted(scored_results, key=lambda x: x["score"], reverse=True)
     
-    print(f"\nSearching for: '{args.query}'...\n")
-    results = search_code(args.query, top_k=args.top_k)
-    
-    if not results:
-        print("No results found.")
-        return
-        
-    for i, res in enumerate(results, 1):
-        print(f"{'='*50}")
-        print(f"Rank {i} (Score: {res['score']:.4f})")
-        print(f"Document ID: {res['id']}")
-        if res['func_name']:
-            print(f"Function: {res['func_name']} ({res['repository']})")
-        print(f"Description: {res['description']}")
-        print(f"\nCode ({res['language']}):\n{res['code']}")
-        
-    print(f"{'='*50}")
+    # 4. Return top_k_return
+    return scored_results[:top_k_return]
 
 if __name__ == "__main__":
-    main()
+    import sys
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "parse json file"
+    print(f"Searching for: '{query}'")
+    results = search_code(query)
+    for i, res in enumerate(results):
+        print(f"\\n--- Result {i+1} (Score: {res['score']:.4f}) ---")
+        print(f"Description: {res['description']}")
+        print(f"Code:\\n{res['code'][:300]}") # truncate code output to keep it neat
+        if len(res['code']) > 300:
+            print("... (truncated)")
