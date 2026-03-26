@@ -1,0 +1,8 @@
+datasets
+sentence-transformers
+chromadb
+openai
+fastapi
+uvicorn
+tqdm
+python-dotenv
